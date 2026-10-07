@@ -8,7 +8,7 @@ import ts from 'typescript'
 // No SDK download, network call, credentials, or payment occurs.
 function setup() {
   const calls = [], scripts = [], options = [], closes = [], mounts = [], unmounts = []
-  let createResponse
+  let createResponse, paymentResponse
   const context = vm.createContext({
     ref: value => ({ value }),
     computed: getter => ({ get value() { return getter() } }),
@@ -35,7 +35,8 @@ function setup() {
       calls.push({ url, init })
       if (url === '/api/paypal/config') return { environment: init.query.environment, clientId: `${init.query.environment}-client-id` }
       if (url === '/api/paypal/orders') return createResponse ? createResponse() : { id: 'ORDER1234567890', proof: 'proof', environment: init.body.environment }
-      return { environment: 'live', orderId: 'ORDER1234567890', captureId: 'CAPTURE1', status: 'COMPLETED', amount: { currency_code: 'USD', value: '1.00' } }
+      if (paymentResponse) return paymentResponse()
+      return { environment: vm.runInContext('environment.value', context), orderId: 'ORDER1234567890', captureId: 'CAPTURE1', status: 'COMPLETED', amount: { currency_code: 'USD', value: '1.00' } }
     }
   })
   const source = readFileSync(new URL('../app/pages/index.vue', import.meta.url), 'utf8').match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
@@ -43,11 +44,35 @@ function setup() {
   vm.runInContext('container.value = { replaceChildren() {} }', context)
   const run = expression => vm.runInContext(expression, context)
   return { calls, scripts, options, closes, mounts, unmounts, run,
-    setCreate: value => { createResponse = value } }
+    setCreate: value => { createResponse = value }, setPayment: value => { paymentResponse = value } }
 }
 function actions() {
   return { resolved: false, rejected: false, async resolve() { this.resolved = true }, async reject() { this.rejected = true } }
 }
+
+test('read-only re-verification clears old success and never calls the capture route', async () => {
+  const s = setup()
+  await s.mounts[0]()
+  s.run("order = { id: 'ORDER1234567890', environment: 'sandbox', proof: 'proof' }; result.value = { status: 'COMPLETED' }")
+  s.setPayment(() => { throw new Error('lookup unavailable') })
+  await s.run("capture('ORDER1234567890', true)")
+  assert.equal(s.run('result.value'), undefined)
+  assert.equal(s.run('state.value'), 'error')
+  assert.ok(s.calls.at(-1).url.endsWith('/verify'))
+  assert.ok(s.calls.every(call => !call.url.endsWith('/capture')))
+  await s.unmounts[0]()
+})
+
+test('browser refuses a successful response belonging to a different checkout', async () => {
+  const s = setup()
+  await s.mounts[0]()
+  s.run("order = { id: 'ORDER1234567890', environment: 'sandbox', proof: 'proof' }")
+  s.setPayment(() => ({ environment: 'sandbox', orderId: 'DIFFERENTORDER', status: 'COMPLETED', amount: { currency_code: 'USD', value: '1.00' } }))
+  await s.run("capture('ORDER1234567890', true)")
+  assert.equal(s.run('result.value'), undefined)
+  assert.equal(s.run('state.value'), 'error')
+  await s.unmounts[0]()
+})
 
 test('initially Sandbox; switching clears state, closes old buttons, removes old SDK and loads matching ID', async () => {
   const s = setup()

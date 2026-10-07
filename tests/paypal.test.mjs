@@ -7,6 +7,68 @@ function completed(id) {
 }
 const operations = s => s.calls.filter(call => !call.url.endsWith('/token'))
 
+test('capture rejection shows a documented issue without leaking upstream details or retrying capture', async () => {
+  const s = setup()
+  await s.newOrder()
+  s.responses.push(Object.assign(new Error('private'), { statusCode: 422, data: {
+    details: [{ issue: 'INSTRUMENT_DECLINED', description: 'private card details' }], debug_id: 'f20578465a4a1'
+  } }))
+  await assert.rejects(s.capture(s.event), error => {
+    assert.match(error.message, /INSTRUMENT_DECLINED/)
+    assert.match(error.message, /f20578465a4a1/)
+    assert.doesNotMatch(error.message, /private/)
+    return true
+  })
+  s.responses.push(completed(s.event.id))
+  await s.capture(s.event)
+  assert.equal(operations(s).filter(call => call.url.endsWith('/capture')).length, 1)
+})
+
+test('another instance retains the sanitized rejection when status checks find no capture', async () => {
+  const shared = { records: new Map(), locks: new Map(), calls: [], responses: [] }
+  const a = setup(shared), b = setup(shared)
+  const order = await a.newOrder()
+  shared.responses.push(Object.assign(new Error('private error'), { statusCode: 422, data: {
+    details: [{ issue: 'ORDER_NOT_APPROVED', description: 'private buyer details' }], debug_id: 'safe-reference'
+  } }))
+  await assert.rejects(a.capture(a.event), { statusCode: 502 })
+  const record = shared.records.get(`captures:sandbox:${order.id}`)
+  assert.deepEqual(JSON.parse(JSON.stringify(record.captureFailure)), { stage: 'capture', issue: 'ORDER_NOT_APPROVED', debugId: 'safe-reference' })
+  assert.doesNotMatch(JSON.stringify(record), /private/)
+  b.event.cookies = { ...a.event.cookies }
+  b.event.body = { proof: order.proof }
+  shared.responses.push({ id: order.id, status: 'APPROVED' })
+  await assert.rejects(b.capture(b.event), error => {
+    assert.match(error.message, /Order status: APPROVED; capture status: NONE_REPORTED/)
+    assert.match(error.message, /ORDER_NOT_APPROVED/)
+    assert.match(error.message, /safe-reference/)
+    return true
+  })
+  assert.equal(shared.calls.filter(call => call.url.endsWith('/capture')).length, 1)
+  assert.equal(shared.calls.at(-1).options.method, 'GET')
+})
+
+test('PayPal failures identify the stage and expose only a safe support reference', async () => {
+  const s = setup()
+  s.responses.push(Object.assign(new Error('private upstream data'), {
+    statusCode: 422, data: { debug_id: 'abc123', message: 'buyer-private-data', details: [{ description: 'secret' }] }
+  }))
+  await assert.rejects(s.globals.paypalRequest(s.event, 'sandbox', '/v2/checkout/orders', {}), error => {
+    assert.match(error.message, /sandbox order creation failed/)
+    assert.match(error.message, /does not capture or charge/)
+    assert.match(error.message, /abc123/)
+    assert.doesNotMatch(error.message, /buyer-private|secret|private upstream/)
+    return true
+  })
+  const auth = setup({ tokenError: Object.assign(new Error('private'), { statusCode: 401, data: { error: 'invalid_client' } }) })
+  await assert.rejects(auth.globals.paypalRequest(auth.event, 'sandbox', '/v2/checkout/orders', {}), error => {
+    assert.match(error.message, /authentication failed/)
+    assert.match(error.message, /same PayPal app/)
+    assert.match(error.message, /No payment request was sent/)
+    return true
+  })
+})
+
 test('default Sandbox config and public config expose no secrets', () => {
   const s = setup()
   const config = s.getConfig(s.event)
@@ -52,9 +114,10 @@ test('capture uses recorded environment, ignores browser environment, and dedupl
   s.config.paypalLiveTestEnabled = true
   await s.newOrder('live')
   s.event.body.environment = 'sandbox'
-  s.responses.push(completed(s.event.id))
+  s.responses.push(completed(s.event.id), completed(s.event.id))
   const results = await Promise.all([s.capture(s.event), s.capture(s.event)])
   assert.ok(results.every(result => result.environment === 'live' && result.status === 'COMPLETED'))
+  s.responses.push(completed(s.event.id))
   await s.capture(s.event)
   const captures = operations(s).filter(call => call.url.endsWith('/capture'))
   assert.equal(captures.length, 1)

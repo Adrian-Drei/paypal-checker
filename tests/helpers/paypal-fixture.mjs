@@ -4,6 +4,7 @@ import vm from 'node:vm'
 import ts from 'typescript'
 export function setup(shared = {}) {
   const config = {
+    paypalRedisEnabled: true,
     paypalSandboxClientSecret: 'sandbox-test-secret', paypalLiveClientSecret: 'live-test-secret', paypalLiveTestEnabled: false,
     paypalTesterUsername: 'tester', paypalTesterPassword: 'test-only-password-at-least-24-chars',
     paypalRedisRestUrl: 'https://redis.test', paypalRedisRestToken: 'test-only-redis-token', paypalRedisPrefix: 'test',
@@ -42,6 +43,10 @@ export function setup(shared = {}) {
   const globals = {
     Buffer, console, URL, require: createRequire(import.meta.url),
     useRuntimeConfig: () => config,
+    useStorage: () => ({
+      getItem: async key => records.get(key) ?? null,
+      setItem: async (key, value) => { records.set(key, structuredClone(value)) }
+    }),
     createError: data => Object.assign(new Error(data.statusMessage), data),
     defineEventHandler: handler => handler,
     getHeader: e => e.origin,
@@ -54,7 +59,10 @@ export function setup(shared = {}) {
     $fetch: async (url, options) => {
       if (url === 'https://redis.test/') return { result: shared.redisTransport ? await shared.redisTransport(options.body) : redis(options.body) }
       calls.push({ url, options })
-      if (url.endsWith('/token')) return { access_token: 'mock-token' }
+      if (url.endsWith('/token')) {
+        if (shared.tokenError) throw shared.tokenError
+        return { access_token: 'mock-token' }
+      }
       const response = responses.shift()
       if (response instanceof Error) throw response
       return typeof response === 'function' ? response() : response
@@ -63,7 +71,8 @@ export function setup(shared = {}) {
   globals.$fetch.raw = async (url, options) => ({ _data: await globals.$fetch(url, options), headers: { get: () => null } })
   function load(path) {
     const context = vm.createContext({ ...globals, exports: {} })
-    vm.runInContext(ts.transpileModule(readFileSync(new URL(path, import.meta.url), 'utf8'), {
+    const source = shared.sourceLoader?.(path) ?? readFileSync(new URL(path, import.meta.url), 'utf8')
+    vm.runInContext(ts.transpileModule(source, {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
     }).outputText, context)
     return context.exports
@@ -72,6 +81,7 @@ export function setup(shared = {}) {
   globals.signInPayPalTester(event, config.paypalTesterUsername, config.paypalTesterPassword)
   const create = load('../../server/api/paypal/orders.post.ts').default
   return { config, calls, responses, records, locks, event, globals, create,
+    verify: load('../../server/api/paypal/orders/[id]/verify.post.ts').default,
     capture: load('../../server/api/paypal/orders/[id]/capture.post.ts').default,
     getConfig: load('../../server/api/paypal/config.get.ts').default,
     middleware: load('../../server/middleware/paypal-tester.ts').default,

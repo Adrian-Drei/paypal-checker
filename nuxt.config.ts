@@ -11,6 +11,7 @@ export default defineNuxtConfig({
     externals: { inline: ['nuxt'] }
   },
   runtimeConfig: {
+    paypalRedisEnabled: true,
     paypalRedisRestUrl: '',
     paypalRedisRestToken: '',
     paypalRedisPrefix: 'paypal-checker',

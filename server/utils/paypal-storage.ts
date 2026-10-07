@@ -24,6 +24,9 @@ function lockError() {
 
 export function paypalStorage(event: H3Event) {
   const config = useRuntimeConfig(event)
+  if (String(config.paypalRedisEnabled) !== 'true') {
+    throw createError({ statusCode: 503, statusMessage: 'PayPal Redis storage is disabled. Payment creation, capture and stored-order verification are paused. Enable NUXT_PAYPAL_REDIS_ENABLED and restart to resume; existing records are preserved.' })
+  }
   let url: URL
   try {
     url = new URL(config.paypalRedisRestUrl)

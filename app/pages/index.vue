@@ -1,6 +1,6 @@
 <script setup lang="ts">
 type Environment = 'sandbox' | 'live'
-type Result = { orderId: string; captureId: string; environment: Environment; status: string; amount: { currency_code: string; value: string } }
+type Result = { orderId: string; captureId: string; environment: Environment; status: string; amount: { currency_code: string; value: string }; recipientMerchantId: string | null; verificationSource: 'paypal-response' | 'fresh-paypal-lookup'; verifiedAt: string }
 type Order = { id: string; proof: string; environment: Environment }
 type Buttons = { render: (element: HTMLElement) => Promise<void>; close: () => Promise<void>; isEligible: () => boolean }
 type PayPal = { Buttons: (options: {
@@ -70,15 +70,20 @@ async function cleanupSDK() {
   namespace = ''
 }
 
-async function capture(id: string) {
+async function capture(id: string, verifyOnly = false) {
   if (captureInFlight) return
   captureInFlight = true
   operationBusy.value = true
   state.value = 'capturing'
+  result.value = undefined
   message.value = 'Capturing or checking the existing capture, and verifying USD 1.00 on the server…'
   try {
     if (!order || order.id !== id || order.environment !== environment.value) throw new Error('Order mismatch')
-    result.value = await $fetch<Result>(`/api/paypal/orders/${id}/capture`, { method: 'POST', body: { proof: order.proof }, retry: 0 })
+    approvedOrder.value = id
+    const verified = await $fetch<Result>(`/api/paypal/orders/${id}/${verifyOnly ? 'verify' : 'capture'}`, { method: 'POST', body: { proof: order.proof }, retry: 0 })
+    if (verified.orderId !== id || verified.environment !== environment.value || verified.status !== 'COMPLETED'
+      || verified.amount?.currency_code !== 'USD' || verified.amount.value !== '1.00') throw new Error('Verification mismatch')
+    result.value = verified
     state.value = 'success'
     message.value = result.value.environment === 'live' ? 'Live capture verified — USD 1.00 was actually charged. Verify it in the Live seller account.' : 'Sandbox capture verified — USD 1.00. No real money moved.'
     approvedOrder.value = undefined
@@ -230,7 +235,7 @@ onBeforeUnmount(() => { disposed = true; finishConfirmation(false); void cleanup
         </div>
         <div v-show="!result && !approvedOrder" ref="container" />
         <template v-if="state === 'error' && approvedOrder">
-          <button class="rounded-lg bg-blue-700 px-4 py-2 text-white disabled:opacity-50" :disabled="operationBusy" @click="capture(approvedOrder)">Check capture status</button>
+          <button class="rounded-lg bg-blue-700 px-4 py-2 text-white disabled:opacity-50" :disabled="operationBusy" @click="capture(approvedOrder, true)">Check capture status</button>
           <button class="mt-3 block text-sm text-blue-700 underline disabled:opacity-50" :disabled="operationBusy" @click="resetAfterVerification">Reset after verifying seller account</button>
         </template>
         <button v-else-if="state === 'error' || state === 'success'" class="mt-3 text-sm text-blue-700 underline disabled:opacity-50" :disabled="switchLocked" @click="loadEnvironment(environment)">Reset selected checkout</button>
@@ -240,6 +245,17 @@ onBeforeUnmount(() => { disposed = true; finishConfirmation(false); void cleanup
     <section v-if="result" class="mt-6 rounded-2xl border border-green-200 bg-white p-6">
       <h2 class="font-bold">Verified <span class="capitalize">{{ result.environment }}</span> capture</h2>
       <dl class="mt-3 grid gap-2 break-all text-sm"><div><dt class="font-bold">Order ID</dt><dd>{{ result.orderId }}</dd></div><div><dt class="font-bold">Capture ID</dt><dd>{{ result.captureId }}</dd></div><div><dt class="font-bold">Status / amount</dt><dd>{{ result.status }} / {{ result.amount.currency_code }} {{ result.amount.value }}</dd></div></dl>
+      <details class="mt-4 rounded-lg border border-slate-200 p-4 text-sm">
+        <summary class="cursor-pointer font-bold">Payment diagnostics</summary>
+        <dl class="mt-3 grid gap-2 break-all">
+          <div><dt class="font-bold">Environment</dt><dd>{{ result.environment }}</dd></div>
+          <div><dt class="font-bold">Recipient merchant ID</dt><dd>{{ result.recipientMerchantId ?? 'Not provided by PayPal' }}</dd></div>
+          <div><dt class="font-bold">Verification source</dt><dd>{{ result.verificationSource === 'fresh-paypal-lookup' ? 'Fresh PayPal order lookup' : 'PayPal capture response' }}; stored data alone is not used to show success.</dd></div>
+          <div><dt class="font-bold">Verified at</dt><dd>{{ result.verifiedAt }}</dd></div>
+        </dl>
+        <p class="mt-3 text-slate-600">Check Activity in the Business seller account matching this merchant ID.</p>
+        <button class="mt-3 text-blue-700 underline disabled:opacity-50" :disabled="operationBusy" @click="capture(result.orderId, true)">Verify again with PayPal (read only)</button>
+      </details>
     </section>
   </main>
 </template>

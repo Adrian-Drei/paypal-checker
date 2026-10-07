@@ -1,4 +1,4 @@
-import type { PayPalOrderResponse, StoredPayPalOrder } from '../../../../utils/paypal'
+import type { PayPalFailure, PayPalOrderResponse, StoredPayPalOrder } from '../../../../utils/paypal'
 
 export default defineEventHandler(async (event) => {
   requirePayPalTester(event)
@@ -21,18 +21,33 @@ export default defineEventHandler(async (event) => {
     // Canonical capture state is keyed by PayPal order, even if create retries yielded another proof.
     const key = `captures:${environment}:${id}`
     const stored = await storage.getItem<StoredPayPalOrder>(key) ?? created
-    if (stored.result) return stored.result
+    if (stored.id !== id || stored.environment !== environment || stored.owner !== owner) {
+      throw createError({ statusCode: 409, statusMessage: 'Stored payment does not match this checkout.' })
+    }
     let order: PayPalOrderResponse
-    if (stored.captureAttemptedAt) {
+    const lookupOnly = !!(stored.captureAttemptedAt || stored.result)
+    if (lookupOnly) {
       // A lost response may hide a completed charge. Reconcile; never send a second capture.
       order = await paypalRequest<PayPalOrderResponse>(event, environment, `/v2/checkout/orders/${id}`)
     } else {
       // Persist BEFORE dispatch. A crash or timeout must not turn a retry into another charge.
       stored.captureAttemptedAt = Date.now()
       await storage.setItem(key, stored)
-      order = await paypalRequest<PayPalOrderResponse>(event, environment, `/v2/checkout/orders/${id}/capture`, {}, `capture-${environment}-${id}`)
+      try {
+        order = await paypalRequest<PayPalOrderResponse>(event, environment, `/v2/checkout/orders/${id}/capture`, {}, `capture-${environment}-${id}`)
+      } catch (error: unknown) {
+        // paypalRequest constructs this minimal metadata; never store raw upstream errors.
+        const failure = (error as { data?: { paypalFailure?: PayPalFailure } })?.data?.paypalFailure
+        if (failure) {
+          stored.captureFailure = failure
+          // The pre-dispatch marker is already durable. Preserve the original error
+          // even if storage/lease loss prevents saving optional diagnostic metadata.
+          await storage.setItem(key, stored).catch(() => {})
+        }
+        throw error
+      }
     }
-    stored.result = validatePayPalCapture(order, stored)
+    stored.result = validatePayPalCapture(order, stored, lookupOnly ? 'fresh-paypal-lookup' : 'paypal-response')
     await storage.setItem(key, stored)
     return stored.result
   })

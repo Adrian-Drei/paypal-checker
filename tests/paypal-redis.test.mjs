@@ -23,10 +23,11 @@ test('real Redis: durable records, independent-instance concurrency, both paymen
       b.event.body = { environment, liveConfirmed: true, requestId: '12345678-1234-1234-1234-123456789012' }
       assert.equal((await b.create(b.event)).proof, order.proof, 'Create retry survives Redis restart')
       b.event.body = { proof: order.proof }
-      shared.responses.push(completed(order.id))
+      shared.responses.push(completed(order.id), completed(order.id))
       await Promise.all([a.capture(a.event), b.capture(b.event)])
       assert.equal(shared.calls.filter(c => c.url.endsWith('/capture')).length, 1)
       await redis.restart()
+      shared.responses.push(completed(order.id))
       assert.equal((await b.capture(b.event)).status, 'COMPLETED', 'Verified capture survives Redis restart')
       assert.equal(shared.calls.filter(c => c.url.endsWith('/capture')).length, 1)
       const apiBase = environment === 'live' ? 'https://api-m.paypal.com/' : 'https://api-m.sandbox.paypal.com/'
