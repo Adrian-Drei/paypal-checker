@@ -1,0 +1,27 @@
+{
+  "name": "paypal-checker",
+  "type": "module",
+  "private": true,
+  "engines": { "node": "^22.22.3 || ^24.15.0 || >=26.0.0" },
+  "scripts": {
+    "build": "nuxt build",
+    "typecheck": "nuxt typecheck",
+    "test": "node --test tests/*.test.mjs",
+    "dev": "nuxt dev",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "nuxt prepare"
+  },
+  "dependencies": {
+    "nuxt": "^4.6.0",
+    "vue": "^3.5.43",
+    "vue-router": "^5.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^24.19.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~5.9.3",
+    "vue-tsc": "^3.3.12"
+  }
+}
