@@ -34,7 +34,8 @@ try {
   assert.equal(lockedPage.headers.get('www-authenticate'), null)
   const signIn = await request('/sign-in')
   assert.equal(signIn.status, 200)
-  assert.ok((await signIn.text()).includes('Welcome back'))
+  const signInHtml = await signIn.text()
+  assert.ok(signInHtml.includes('<dialog') && signInHtml.includes('id="tester-password"'))
   for (const path of ['/api/paypal/access', '/api/paypal/config']) {
     const response = await request(path)
     assert.equal(response.status, 401)

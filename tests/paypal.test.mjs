@@ -1,69 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
-import vm from 'node:vm'
-import ts from 'typescript'
 import { createHmac } from 'node:crypto'
-
-function setup() {
-  const config = {
-    paypalSandboxClientSecret: 'sandbox-test-secret', paypalLiveClientSecret: 'live-test-secret', paypalLiveTestEnabled: false,
-    paypalTesterUsername: 'tester', paypalTesterPassword: 'test-only-password-at-least-24-chars',
-    public: { paypalSandboxClientId: 'sandbox-test-id', paypalLiveClientId: 'live-test-id' }
-  }
-  const calls = [], responses = [], records = new Map()
-  const event = { cookies: {}, body: {}, origin: 'http://localhost:3000', url: 'http://localhost:3000/api/paypal/orders', id: 'TESTORDER123456789', query: {}, auth: `Basic ${Buffer.from(`${config.paypalTesterUsername}:${config.paypalTesterPassword}`).toString('base64')}` }
-  const storage = {
-    getItem: async key => records.has(key) ? structuredClone(records.get(key)) : null,
-    setItem: async (key, value) => { records.set(key, structuredClone(value)) }
-  }
-  const globals = {
-    Buffer, console, require: createRequire(import.meta.url),
-    useRuntimeConfig: () => config,
-    createError: data => Object.assign(new Error(data.statusMessage), data),
-    defineEventHandler: handler => handler,
-    getHeader: e => e.origin,
-    getRequestURL: e => new URL(e.url), getQuery: e => e.query,
-    getRequestIP: () => '127.0.0.1',
-    setHeader: () => {},
-    getCookie: (e, key) => e.cookies[key],
-    setCookie: (e, key, value) => { e.cookies[key] = value },
-    readBody: async e => e.body, getRouterParam: e => e.id,
-    useStorage: () => storage,
-    $fetch: async (url, options) => {
-      calls.push({ url, options })
-      if (url.endsWith('/token')) return { access_token: 'mock-token' }
-      const response = responses.shift()
-      if (response instanceof Error) throw response
-      return typeof response === 'function' ? response() : response
-    }
-  }
-  globals.$fetch.raw = async (url, options) => ({ _data: await globals.$fetch(url, options) })
-  function load(path) {
-    const context = vm.createContext({ ...globals, exports: {} })
-    vm.runInContext(ts.transpileModule(readFileSync(new URL(path, import.meta.url), 'utf8'), {
-      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
-    }).outputText, context)
-    return context.exports
-  }
-  Object.assign(globals, load('../server/utils/paypal-auth.ts'), load('../server/utils/paypal.ts'))
-  globals.signInPayPalTester(event, config.paypalTesterUsername, config.paypalTesterPassword)
-  const create = load('../server/api/paypal/orders.post.ts').default
-  return { config, calls, responses, records, event, globals, create,
-    capture: load('../server/api/paypal/orders/[id]/capture.post.ts').default,
-    getConfig: load('../server/api/paypal/config.get.ts').default,
-    middleware: load('../server/middleware/paypal-tester.ts').default,
-    async newOrder(environment = 'sandbox') {
-      event.body = { environment, liveConfirmed: true, requestId: '12345678-1234-1234-1234-123456789012', amount: '999', currency: 'EUR' }
-      responses.push({ id: event.id, status: 'CREATED' })
-      const order = await create(event)
-      event.body = { proof: order.proof }
-      return order
-    }
-  }
-}
-
+import { setup } from './helpers/paypal-fixture.mjs'
 function completed(id) {
   return { id, status: 'COMPLETED', purchase_units: [{ reference_id: 'checkout-test-product', payments: { captures: [{ id: 'CAPTURE123', status: 'COMPLETED', amount: { currency_code: 'USD', value: '1.00' } }] } }] }
 }

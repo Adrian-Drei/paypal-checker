@@ -66,17 +66,6 @@ export function paypalOwner(event: H3Event) {
   return createHash('sha256').update(sessionId(event)).digest('hex')
 }
 
-// Single Node process test harness. PayPal request IDs also guard upstream operations.
-const operations = new Map<string, Promise<unknown>>()
-export async function withPayPalLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
-  const current = operations.get(key)
-  if (current) return current as Promise<T>
-  const promise = operation()
-  operations.set(key, promise)
-  try { return await promise }
-  finally { if (operations.get(key) === promise) operations.delete(key) }
-}
-
 export function validatePayPalCapture(order: PayPalOrderResponse, stored: StoredPayPalOrder): CaptureResult {
   const units = order.purchase_units
   const captures = units?.[0]?.payments?.captures

@@ -16,6 +16,9 @@ NUXT_PAYPAL_LIVE_CLIENT_SECRET=
 NUXT_PAYPAL_LIVE_TEST_ENABLED=false
 NUXT_PAYPAL_TESTER_USERNAME=
 NUXT_PAYPAL_TESTER_PASSWORD=
+NUXT_PAYPAL_REDIS_REST_URL=
+NUXT_PAYPAL_REDIS_REST_TOKEN=
+NUXT_PAYPAL_REDIS_PREFIX=paypal-checker
 ```
 
 In [PayPal Developer > Apps & Credentials](https://developer.paypal.com/dashboard/applications), select **Sandbox** and copy the Client ID and Secret from the same Sandbox REST app into the Sandbox variables. Select **Live** and copy the matching Live app credentials into the Live variables only if you intend to enable Live testing. Credential environment is not reliably inferred from the ID; use the correct Dashboard tab. Rotate any previously exposed secret. All secrets and the Live enable flag remain in server-only Nuxt runtime config; only Client IDs are public.
@@ -28,7 +31,17 @@ Run `npm install`, then `npm run dev`, and open `http://localhost:3000/`. Outsid
 
 Set both Live credential values and explicitly set `NUXT_PAYPAL_LIVE_TEST_ENABLED=true`. Restart the Nuxt process after changing local `.env`. In an existing hosted installation, update its server environment and restart/redeploy through your normal approved process; changing browser code or a query parameter cannot enable Live. This task does not deploy anything. Set the flag back to `false` and restart when done; new Live orders and captures/status requests are then rejected server-side.
 
-Nuxt loads `.env` in development/build. A built server does not automatically load `.env`; supply the environment explicitly when running `node .output/server/index.mjs`. Do not statically generate this server-backed app. Run a **single Node server process** with a persistent writable `.data/paypal` directory; keep it across restarts and out of web-accessible assets. This test harness uses filesystem order records and in-process concurrency locks, not a database with distributed locks. Horizontal/serverless deployment requires a shared transactional store and distributed operation locking first.
+Nuxt loads `.env` in development/build. A built server does not automatically load `.env`; supply the environment explicitly when running `node .output/server/index.mjs`. Do not statically generate this server-backed app. Payment records and operation locks use persistent Redis over HTTPS and are shared across Node processes and Vercel function instances. There is no filesystem, `/tmp`, or process-memory fallback for payment storage.
+
+## Persistent Redis configuration for Vercel
+
+1. Create/connect a persistent Upstash Redis database through the Vercel Marketplace or Upstash Console. Use a single-region primary database and keep **eviction disabled**. This is payment state, not disposable cache; do not use a read replica, temporary trial database, or automatically expiring dataset. Keep backups and monitor capacity/write failures.
+2. In Vercel **Project Settings > Environment Variables**, set `NUXT_PAYPAL_REDIS_REST_URL` to its HTTPS REST URL and `NUXT_PAYPAL_REDIS_REST_TOKEN` to its read/write REST token. These are server-only. If the integration provides `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`, copy their values into the matching `NUXT_PAYPAL_...` variables. Do not put tokens in public variables, URLs, source control, or chat.
+3. Set `NUXT_PAYPAL_REDIS_PREFIX` to a stable project namespace, e.g. `paypal-checker-production`. All production instances and redeploys must use the same namespace/database; isolate Preview/development with a different database or prefix. Sandbox/Live attempt IDs and capture keys are separated within that namespace.
+4. Add the same variables to local `.env` for development. Restart locally; redeploy Vercel through your approved process after setting server environment variables. No deployment is performed by this change. Missing Redis configuration returns a sanitized 503 before creating/capturing a payment.
+5. The application uses Upstash REST JSON commands, atomic Lua operations, and per-request synchronization tokens. Related keys share a Redis Cluster hash tag. There are no local record caches. As with any distributed datastore, durability depends on the provider: preserve the primary database, eviction settings and backups; a cache reset or lost database cannot preserve duplicate-prevention records.
+
+Old `.data/paypal` records are not automatically imported. Reconcile any uncertain existing transactions in the correct PayPal seller account before starting new tests; do not change request IDs or clear records to retry an uncertain capture.
 
 ## Environment switching and Live inspection
 
@@ -61,7 +74,7 @@ For Sandbox buyers, open [PayPal Developer > Sandbox accounts](https://developer
 
 The server stores order ID, environment, session-owner hash, capture-attempt timestamp, and the minimal validated result. No access tokens, credentials, card details, or full buyer responses are stored/logged. Browser-supplied prices are ignored. Capture takes an opaque checkout proof and order ID; environment is read from the server record, never the browser. Proofs are random, bound to an HttpOnly session cookie, and returned only to authorized testers. Preserve the session cookie when checking a capture.
 
-Create request IDs include the environment and session, and are persisted for retries with a conservative one-hour retry limit. PayPal's idempotency retention is limited; these keys are not permanent transaction storage. Concurrent operations coalesce in the single server process. Capture uses `PayPal-Request-Id`, persists its attempt **before** sending, caches verified results, and never dispatches another capture POST for a recorded attempt. Retries perform a GET and validate the result. If the process fails between persisting the attempt and dispatching capture, a retry may report an uncompleted order; verify the seller account and reset safely instead of automatically sending another capture. Preserve order storage; do not clear it to retry payments.
+Create request IDs include the environment and session, and are persisted with the proof before calling PayPal. Retries retain the same proof and `PayPal-Request-Id`, with a conservative one-hour retry limit for incomplete creates. A distributed Redis `SET NX PX` lease coordinates each create/capture across serverless instances. Lua scripts check the unique lease token atomically with every locked read/write, and only the owner may release the lock. Expired owners cannot overwrite results or delete replacement locks. Busy operations return a sanitized 409 after a short wait; retry the same operation. Capture permanently records its attempt before dispatch, caches verified results, and never sends a second capture POST for that record. A retry reconciles via PayPal GET. If a process dies after marking an attempt but before sending capture, verify the seller account before resetting. Records/attempt markers have no TTL; only leases expire. Redis outages return sanitized 503 errors and never fall back to local storage. Preserve storage and the namespace across redeploys.
 
 Run sequentially with the supported Node runtime:
 
@@ -72,7 +85,7 @@ npm run build
 npm run test:smoke
 ```
 
-Tests mock PayPal and use no real credentials or network/payments. Actual SDK eligibility/guest UI and end-to-end approval still need manual testing with configured accounts. Nuxt is explicitly inlined into the Nitro server bundle to resolve generated renderer data with the installed Nuxt version.
+Tests mock PayPal and use no real payment credentials or PayPal network calls. When a Redis executable is available, the Redis integration test runs real Lua operations against an isolated local Redis with AOF persistence and verifies records survive restarts, concurrent independent instances capture once, both environment routes use matching credentials/endpoints, and stale lock writes/releases are rejected. Set `PAYPAL_TEST_REDIS_SERVER` to a Redis executable outside Laragon; without one, that integration test is explicitly skipped. This test dataset is separate from production Redis. Actual SDK eligibility/guest UI and end-to-end approval still need manual testing with configured accounts. Nuxt is explicitly inlined into the Nitro server bundle to resolve generated renderer data with the installed Nuxt version.
 
 ## Official references checked
 
@@ -84,3 +97,6 @@ Tests mock PayPal and use no real credentials or network/payments. Actual SDK el
 - [Nuxt runtime config](https://nuxt.com/docs/4.x/guide/going-further/runtime-config)
 
 
+
+- [Upstash REST API](https://upstash.com/docs/redis/features/restapi), [durability](https://upstash.com/docs/redis/features/durability), and [eviction settings](https://upstash.com/docs/redis/features/eviction)
+- [Redis distributed locks](https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/) and [Redis on Vercel](https://vercel.com/docs/redis)

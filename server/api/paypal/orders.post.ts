@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 import type { StoredPayPalOrder } from '../../utils/paypal'
 
-interface CreateAttempt { startedAt: number; order?: { id: string; proof: string; environment: 'sandbox' | 'live' } }
+interface CreateAttempt { startedAt: number; proof: string; order?: { id: string; proof: string; environment: 'sandbox' | 'live' } }
 
 export default defineEventHandler(async (event) => {
   requirePayPalTester(event)
@@ -17,10 +17,9 @@ export default defineEventHandler(async (event) => {
   }
   const owner = paypalOwner(event)
   const requestId = createHash('sha256').update(`${environment}:${owner}:${body.requestId}`).digest('hex').slice(0, 32)
-  return withPayPalLock(`new-${requestId}`, async () => {
-    const storage = useStorage('paypal')
+  return withPayPalLock(event, `new-${requestId}`, async (storage) => {
     const key = `attempts:${requestId}`
-    const attempt = await storage.getItem<CreateAttempt>(key) ?? { startedAt: Date.now() }
+    const attempt = await storage.getItem<CreateAttempt>(key) ?? { startedAt: Date.now(), proof: randomBytes(32).toString('hex') }
     if (attempt.order) return attempt.order
     // Bound retries conservatively; upstream idempotency keys are not permanent storage.
     if (Date.now() - attempt.startedAt > 60 * 60 * 1000) {
@@ -34,7 +33,7 @@ export default defineEventHandler(async (event) => {
     if (!order.id || !/^[A-Z0-9]{10,32}$/.test(order.id) || !['CREATED', 'APPROVED', 'PAYER_ACTION_REQUIRED'].includes(order.status ?? '')) {
       throw createError({ statusCode: 502, statusMessage: 'Invalid PayPal order response.' })
     }
-    const proof = randomBytes(32).toString('hex')
+    const proof = attempt.proof
     await storage.setItem(`orders:${proof}`, { id: order.id, environment, owner, createdAt: Date.now() } satisfies StoredPayPalOrder)
     attempt.order = { id: order.id, proof, environment }
     await storage.setItem(key, attempt)

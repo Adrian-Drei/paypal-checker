@@ -9,7 +9,7 @@ export default defineEventHandler(async (event) => {
     throw createError({ statusCode: 400, statusMessage: 'Invalid order or checkout proof.' })
   }
   const owner = paypalOwner(event)
-  const storage = useStorage('paypal')
+  const storage = paypalStorage(event)
   const created = await storage.getItem<StoredPayPalOrder>(`orders:${body.proof}`)
   if (!created || created.id !== id || created.owner !== owner) {
     throw createError({ statusCode: 403, statusMessage: 'Order does not belong to this checkout session.' })
@@ -17,7 +17,7 @@ export default defineEventHandler(async (event) => {
   // Never select capture credentials from browser-supplied environment values.
   const environment = parsePayPalEnvironment(created.environment)
   paypalConfig(event, environment)
-  return withPayPalLock(`capture-${environment}-${id}`, async () => {
+  return withPayPalLock(event, `capture-${environment}-${id}`, async (storage) => {
     // Canonical capture state is keyed by PayPal order, even if create retries yielded another proof.
     const key = `captures:${environment}:${id}`
     const stored = await storage.getItem<StoredPayPalOrder>(key) ?? created
