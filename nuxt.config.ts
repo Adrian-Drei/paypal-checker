@@ -7,10 +7,16 @@ export default defineNuxtConfig({
   css: ['~/assets/css/main.css'],
   vite: { plugins: [tailwindcss()] },
   // Bundle Nuxt's internal renderer so Nitro resolves generated render data.
-  nitro: { externals: { inline: ['nuxt'] } },
+  nitro: {
+    externals: { inline: ['nuxt'] },
+    storage: { paypal: { driver: 'fs', base: './.data/paypal' } }
+  },
   runtimeConfig: {
-    paypalClientSecret: '',
-    paypalEnv: 'sandbox',
-    public: { paypalClientId: '' }
+    paypalSandboxClientSecret: '',
+    paypalLiveClientSecret: '',
+    paypalLiveTestEnabled: false,
+    paypalTesterUsername: '',
+    paypalTesterPassword: '',
+    public: { paypalSandboxClientId: '', paypalLiveClientId: '' }
   }
 })

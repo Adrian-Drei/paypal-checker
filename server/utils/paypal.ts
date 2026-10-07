@@ -1,17 +1,47 @@
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { H3Event } from 'h3'
 
+export type PayPalEnvironment = 'sandbox' | 'live'
 export const product = { currency_code: 'USD', value: '1.00' } as const
+export const productReference = 'checkout-test-product'
+export type CaptureResult = { orderId: string; captureId: string; environment: PayPalEnvironment; status: 'COMPLETED'; amount: typeof product }
+export interface StoredPayPalOrder {
+  id: string
+  environment: PayPalEnvironment
+  owner: string
+  createdAt: number
+  captureAttemptedAt?: number
+  result?: CaptureResult
+}
+export interface PayPalOrderResponse {
+  id?: string
+  status?: string
+  purchase_units?: Array<{
+    reference_id?: string
+    payments?: { captures?: Array<{ id?: string; status?: string; amount?: { currency_code?: string; value?: string } }> }
+  }>
+}
 
-export function paypalConfig(event: H3Event) {
+export function parsePayPalEnvironment(value: unknown): PayPalEnvironment {
+  if (value === undefined) return 'sandbox'
+  if (value !== 'sandbox' && value !== 'live') {
+    throw createError({ statusCode: 400, statusMessage: 'Environment must be sandbox or live.' })
+  }
+  return value
+}
+
+export function paypalConfig(event: H3Event, environment: PayPalEnvironment) {
   const config = useRuntimeConfig(event)
-  if (config.paypalEnv !== 'sandbox') {
-    throw createError({ statusCode: 503, statusMessage: 'This test supports Sandbox only.' })
+  // Fail closed: accept only the explicit boolean true (Nuxt may deserialize env values).
+  if (environment === 'live' && String(config.paypalLiveTestEnabled) !== 'true') {
+    throw createError({ statusCode: 403, statusMessage: 'Live testing is disabled on this server.' })
   }
-  if (!config.public.paypalClientId || !config.paypalClientSecret) {
-    throw createError({ statusCode: 503, statusMessage: 'Configure Sandbox credentials locally and restart Nuxt.' })
+  const clientId = environment === 'live' ? config.public.paypalLiveClientId : config.public.paypalSandboxClientId
+  const secret = environment === 'live' ? config.paypalLiveClientSecret : config.paypalSandboxClientSecret
+  if (!clientId || !secret) {
+    throw createError({ statusCode: 503, statusMessage: `Configure ${environment} credentials locally and restart Nuxt.` })
   }
-  return config
+  return { clientId, secret, base: environment === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com' }
 }
 
 export function requireSameOrigin(event: H3Event) {
@@ -32,39 +62,55 @@ export function sessionId(event: H3Event) {
   return id
 }
 
-export function signature(event: H3Event, value: string) {
-  return createHmac('sha256', paypalConfig(event).paypalClientSecret).update(`${sessionId(event)}:${value}`).digest('hex')
+export function paypalOwner(event: H3Event) {
+  return createHash('sha256').update(sessionId(event)).digest('hex')
 }
 
-export function verifyOrder(event: H3Event, id: string, proof: string) {
-  const expected = signature(event, id)
-  if (!/^[a-f0-9]{64}$/.test(proof) || !timingSafeEqual(Buffer.from(expected), Buffer.from(proof))) {
-    throw createError({ statusCode: 403, statusMessage: 'Order does not belong to this checkout session.' })
+// Single Node process test harness. PayPal request IDs also guard upstream operations.
+const operations = new Map<string, Promise<unknown>>()
+export async function withPayPalLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const current = operations.get(key)
+  if (current) return current as Promise<T>
+  const promise = operation()
+  operations.set(key, promise)
+  try { return await promise }
+  finally { if (operations.get(key) === promise) operations.delete(key) }
+}
+
+export function validatePayPalCapture(order: PayPalOrderResponse, stored: StoredPayPalOrder): CaptureResult {
+  const units = order.purchase_units
+  const captures = units?.[0]?.payments?.captures
+  const capture = captures?.[0]
+  if (order.id !== stored.id || order.status !== 'COMPLETED' || units?.length !== 1
+    || units[0]?.reference_id !== productReference || captures?.length !== 1
+    || !capture?.id || capture.status !== 'COMPLETED'
+    || capture.amount?.currency_code !== product.currency_code || capture.amount.value !== product.value) {
+    throw createError({ statusCode: 422, statusMessage: 'Capture is not verified as COMPLETED for USD 1.00. Check the seller account; do not assume success or start another payment.' })
   }
+  return { orderId: stored.id, captureId: capture.id, environment: stored.environment, status: 'COMPLETED', amount: product }
 }
 
-export async function paypalRequest<T>(event: H3Event, path: string, body: unknown, requestId: string): Promise<T> {
-  const config = paypalConfig(event)
-  const base = 'https://api-m.sandbox.paypal.com'
+export async function paypalRequest<T>(event: H3Event, environment: PayPalEnvironment, path: string, body?: Record<string, unknown>, requestId?: string): Promise<T> {
+  const config = paypalConfig(event, environment)
   try {
-    const token = await $fetch<{ access_token: string }>(`${base}/v1/oauth2/token`, {
+    const token = await $fetch<{ access_token: string }>(`${config.base}/v1/oauth2/token`, {
       method: 'POST', timeout: 15000, retry: 0,
       headers: {
-        Authorization: `Basic ${Buffer.from(`${config.public.paypalClientId}:${config.paypalClientSecret}`).toString('base64')}`,
+        Authorization: `Basic ${Buffer.from(`${config.clientId}:${config.secret}`).toString('base64')}`,
         'Content-Type': 'application/x-www-form-urlencoded'
       }, body: 'grant_type=client_credentials'
     })
     if (!token.access_token) throw new Error('Missing token')
-    const response = await $fetch.raw<T>(`${base}${path}`, {
-      method: 'POST', timeout: 20000, retry: 0,
-      headers: { Authorization: `Bearer ${token.access_token}`, 'PayPal-Request-Id': requestId, Prefer: 'return=representation' },
-      body: body as Record<string, unknown>
+    const response = await $fetch.raw<T>(`${config.base}${path}`, {
+      method: body === undefined ? 'GET' : 'POST', timeout: 20000, retry: 0,
+      headers: { Authorization: `Bearer ${token.access_token}`, ...(requestId ? { 'PayPal-Request-Id': requestId } : {}), Prefer: 'return=representation' },
+      body
     })
     if (!response._data) throw new Error('Missing PayPal response')
-    // This external API is not a Nitro route. Handlers validate its response at runtime.
+    // External API data is validated by the handlers, not Nitro route inference.
     return response._data as T
   } catch {
-    // Never expose or log the upstream request, credentials, tokens, or buyer data.
-    throw createError({ statusCode: 502, statusMessage: 'PayPal Sandbox request failed. Check local credentials or retry the same operation.' })
+    // Never expose/log upstream request objects, credentials, tokens or buyer/card data.
+    throw createError({ statusCode: 502, statusMessage: `PayPal ${environment} request failed. If capture was attempted, check its status and the seller account before another payment.` })
   }
 }

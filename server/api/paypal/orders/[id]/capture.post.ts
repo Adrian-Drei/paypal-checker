@@ -1,29 +1,39 @@
-interface CaptureOrder {
-  id?: string
-  status?: string
-  purchase_units?: Array<{
-    reference_id?: string
-    payments?: { captures?: Array<{ id?: string; status?: string; amount?: { currency_code?: string; value?: string } }> }
-  }>
-}
+import type { PayPalOrderResponse, StoredPayPalOrder } from '../../../../utils/paypal'
 
 export default defineEventHandler(async (event) => {
+  requirePayPalTester(event)
   requireSameOrigin(event)
   const id = getRouterParam(event, 'id') ?? ''
   const body = await readBody(event)
-  if (!/^[A-Z0-9]{10,32}$/.test(id) || typeof body?.proof !== 'string') {
+  if (!/^[A-Z0-9]{10,32}$/.test(id) || typeof body?.proof !== 'string' || !/^[a-f0-9]{64}$/.test(body.proof)) {
     throw createError({ statusCode: 400, statusMessage: 'Invalid order or checkout proof.' })
   }
-  verifyOrder(event, id, body.proof)
-  const order = await paypalRequest<CaptureOrder>(event, `/v2/checkout/orders/${id}/capture`, {}, `capture-${id}`)
-  const units = order.purchase_units
-  const captures = units?.[0]?.payments?.captures
-  const capture = captures?.[0]
-  if (order.id !== id || order.status !== 'COMPLETED' || units?.length !== 1
-    || units[0]?.reference_id !== 'sandbox-test-product' || captures?.length !== 1
-    || !capture?.id || capture.status !== 'COMPLETED'
-    || capture.amount?.currency_code !== product.currency_code || capture.amount.value !== product.value) {
-    throw createError({ statusCode: 422, statusMessage: 'Capture was not verified as COMPLETED for USD 1.00. Do not assume payment success.' })
+  const owner = paypalOwner(event)
+  const storage = useStorage('paypal')
+  const created = await storage.getItem<StoredPayPalOrder>(`orders:${body.proof}`)
+  if (!created || created.id !== id || created.owner !== owner) {
+    throw createError({ statusCode: 403, statusMessage: 'Order does not belong to this checkout session.' })
   }
-  return { orderId: id, captureId: capture.id, status: 'COMPLETED', amount: product }
+  // Never select capture credentials from browser-supplied environment values.
+  const environment = parsePayPalEnvironment(created.environment)
+  paypalConfig(event, environment)
+  return withPayPalLock(`capture-${environment}-${id}`, async () => {
+    // Canonical capture state is keyed by PayPal order, even if create retries yielded another proof.
+    const key = `captures:${environment}:${id}`
+    const stored = await storage.getItem<StoredPayPalOrder>(key) ?? created
+    if (stored.result) return stored.result
+    let order: PayPalOrderResponse
+    if (stored.captureAttemptedAt) {
+      // A lost response may hide a completed charge. Reconcile; never send a second capture.
+      order = await paypalRequest<PayPalOrderResponse>(event, environment, `/v2/checkout/orders/${id}`)
+    } else {
+      // Persist BEFORE dispatch. A crash or timeout must not turn a retry into another charge.
+      stored.captureAttemptedAt = Date.now()
+      await storage.setItem(key, stored)
+      order = await paypalRequest<PayPalOrderResponse>(event, environment, `/v2/checkout/orders/${id}/capture`, {}, `capture-${environment}-${id}`)
+    }
+    stored.result = validatePayPalCapture(order, stored)
+    await storage.setItem(key, stored)
+    return stored.result
+  })
 })

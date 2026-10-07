@@ -1,7 +1,8 @@
 export default defineEventHandler((event) => {
-  paypalConfig(event)
-  // Establish the session before the first create request, including lost-response retries.
+  requirePayPalTester(event)
+  const environment = parsePayPalEnvironment(getQuery(event).environment)
+  const config = paypalConfig(event, environment)
   sessionId(event)
   setHeader(event, 'Cache-Control', 'no-store')
-  return { sandbox: true }
+  return { environment, clientId: config.clientId }
 })
